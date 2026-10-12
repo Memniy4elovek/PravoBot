@@ -1,4 +1,4 @@
-```python
+
 import os
 import json
 import time
@@ -194,4 +194,3 @@ def chat(request: ChatRequest):
         status_code=503,
         detail="Gemini временно недоступна. Попробуй позже."
     )
-```
