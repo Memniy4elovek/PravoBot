@@ -1,15 +1,20 @@
 
+import os
 import json
 import urllib.request
 import urllib.error
-import socket
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
-MODEL = "pravobot-model"
+API_KEY = os.getenv("GEMINI_API_KEY", "")
+MODEL = "gemini-2.5-flash"
+
+GEMINI_URL = (
+    f"https://generativelanguage.googleapis.com/v1beta/"
+    f"models/{MODEL}:generateContent"
+)
 
 app = FastAPI(title="PravoBot API")
 
@@ -51,7 +56,11 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": MODEL}
+    return {
+        "status": "ok",
+        "model": MODEL,
+        "api_key_configured": bool(API_KEY),
+    }
 
 
 @app.post("/chat")
@@ -64,51 +73,95 @@ def chat(request: ChatRequest):
             detail="Сообщение не должно быть пустым."
         )
 
+    if not API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="API-ключ Gemini не настроен в Render."
+        )
+
     payload = {
-        "model": MODEL,
-        "stream": False,
-        "think": False,
-        "options": {
-            "num_ctx": 4096,
-            "num_predict": 256,
-            "temperature": 0.3
+        "system_instruction": {
+            "parts": [{"text": SYSTEM_PROMPT}]
         },
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": message}
-        ]
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": message}]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.3,
+            "maxOutputTokens": 1024
+        }
     }
 
     req = urllib.request.Request(
-        OLLAMA_URL,
+        GEMINI_URL,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "x-goog-api-key": API_KEY,
+        },
         method="POST",
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=240) as response:
-            result = json.loads(response.read().decode("utf-8"))
+        with urllib.request.urlopen(req, timeout=90) as response:
+            result = json.loads(
+                response.read().decode("utf-8")
+            )
 
-        reply = result.get("message", {}).get("content", "").strip()
+        candidates = result.get("candidates", [])
+        parts = (
+            candidates[0]
+            .get("content", {})
+            .get("parts", [])
+            if candidates else []
+        )
+
+        reply = "\n".join(
+            part.get("text", "")
+            for part in parts
+            if part.get("text")
+        ).strip()
 
         if not reply:
             raise HTTPException(
                 status_code=502,
-                detail="Модель не вернула текстовый ответ."
+                detail="Gemini не вернула текстовый ответ."
             )
 
         return {"reply": reply}
 
     except urllib.error.HTTPError as exc:
-        error_text = exc.read().decode("utf-8", errors="replace")
+        error_text = exc.read().decode(
+            "utf-8", errors="replace"
+        )
+        if exc.code in (400, 401, 403):
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Gemini отклонила запрос. Проверь API-ключ, "
+                    "доступность модели и ограничения API."
+                )
+            ) from exc
+
+        if exc.code == 429:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Превышен лимит запросов Gemini. "
+                    "Попробуй позже."
+                )
+            ) from exc
+
         raise HTTPException(
             status_code=502,
-            detail=f"Ошибка Ollama ({exc.code}): {error_text}"
+            detail=f"Ошибка Gemini API ({exc.code}): {error_text[:500]}"
         ) from exc
 
-    except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
+    except (urllib.error.URLError, TimeoutError) as exc:
         raise HTTPException(
             status_code=504,
-            detail="Ollama не ответила вовремя. Попробуй ещё раз."
+            detail="Gemini не ответила вовремя. Попробуй ещё раз."
         ) from exc
