@@ -124,11 +124,16 @@ def get_access_token():
             detail=f"Ошибка авторизации GigaChat ({exc.code})."
         ) from exc
 
-    except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
-        raise HTTPException(
-            status_code=504,
-            detail="Не удалось подключиться к GigaChat для авторизации."
-        ) from exc
+   except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
+    print(
+        f"GigaChat OAuth connection error: "
+        f"{type(exc).__name__}: {exc}",
+        flush=True
+    )
+    raise HTTPException(
+        status_code=504,
+        detail="Не удалось подключиться к GigaChat для авторизации."
+    ) from exc
 
 
 @app.get("/")
