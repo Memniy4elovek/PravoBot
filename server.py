@@ -1,21 +1,23 @@
-
-import os
 import json
+import os
 import time
+import uuid
 import urllib.request
 import urllib.error
+import socket
+from urllib.parse import urlencode
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-API_KEY = os.getenv("GEMINI_API_KEY", "")
-MODEL = "gemini-3.7-flash"
 
-GEMINI_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/"
-    f"models/{MODEL}:generateContent"
-)
+# Настройки из Render Environment
+GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS", "").strip()
+MODEL = os.getenv("GIGACHAT_MODEL", "GigaChat-3-Ultra")
+
+TOKEN_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+CHAT_URL = "https://api.giga.chat/v1/chat/completions"
 
 app = FastAPI(title="PravoBot API")
 
@@ -50,6 +52,85 @@ SYSTEM_PROMPT = """
 """
 
 
+# Кэш токена: повторно используем его до истечения срока
+_access_token = None
+_token_expires_at = 0
+
+
+def get_access_token():
+    global _access_token, _token_expires_at
+
+    if not GIGACHAT_CREDENTIALS:
+        raise HTTPException(
+            status_code=500,
+            detail="Не настроен GIGACHAT_CREDENTIALS в Render."
+        )
+
+    if _access_token and time.time() < _token_expires_at - 60:
+        return _access_token
+
+    data = urlencode({
+        "scope": "GIGACHAT_API_PERS"
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        TOKEN_URL,
+        data=data,
+        headers={
+            "Authorization": f"Basic {GIGACHAT_CREDENTIALS}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "RqUID": str(uuid.uuid4()),
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            result = json.loads(response.read().decode("utf-8"))
+
+        _access_token = result.get("access_token")
+        expires_at = result.get("expires_at", 0)
+
+        if not _access_token:
+            raise HTTPException(
+                status_code=502,
+                detail="GigaChat не вернул токен доступа."
+            )
+
+        _token_expires_at = (
+            float(expires_at)
+            if expires_at
+            else time.time() + 1800
+        )
+
+        return _access_token
+
+    except urllib.error.HTTPError as exc:
+        error_text = exc.read().decode(
+            "utf-8", errors="replace"
+        )
+        if exc.code in (400, 401, 403):
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "GigaChat не выдал токен. "
+                    "Проверь ключ авторизации и права доступа."
+                )
+            ) from exc
+
+        raise HTTPException(
+            status_code=502,
+            detail=f"Ошибка авторизации GigaChat ({exc.code})."
+        ) from exc
+
+    except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="Не удалось подключиться к GigaChat для авторизации."
+        ) from exc
+
+
 @app.get("/")
 def home():
     return {"status": "ok", "service": "PravoBot"}
@@ -57,11 +138,7 @@ def home():
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "model": MODEL,
-        "api_key_configured": bool(API_KEY),
-    }
+    return {"status": "ok", "model": MODEL}
 
 
 @app.post("/chat")
@@ -74,123 +151,85 @@ def chat(request: ChatRequest):
             detail="Сообщение не должно быть пустым."
         )
 
-    if not API_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="API-ключ Gemini не настроен в Render."
-        )
+    token = get_access_token()
 
     payload = {
-        "system_instruction": {
-            "parts": [{"text": SYSTEM_PROMPT}]
-        },
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": message}]
-            }
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": message},
         ],
-        "generationConfig": {
-            "temperature": 0.3,
-            "maxOutputTokens": 1024
-        }
+        "temperature": 0.3,
+        "max_tokens": 1024,
+        "stream": False,
     }
 
     req = urllib.request.Request(
-        GEMINI_URL,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        CHAT_URL,
+        data=json.dumps(
+            payload, ensure_ascii=False
+        ).encode("utf-8"),
         headers={
+            "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
-            "x-goog-api-key": API_KEY,
+            "Accept": "application/json",
         },
         method="POST",
     )
 
-    # До 3 попыток при временной перегрузке Gemini
-    for attempt in range(3):
-        try:
-            with urllib.request.urlopen(req, timeout=90) as response:
-                result = json.loads(
-                    response.read().decode("utf-8")
-                )
-
-            candidates = result.get("candidates", [])
-            parts = (
-                candidates[0]
-                .get("content", {})
-                .get("parts", [])
-                if candidates else []
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            result = json.loads(
+                response.read().decode("utf-8")
             )
 
-            reply = "\n".join(
-                part.get("text", "")
-                for part in parts
-                if part.get("text")
-            ).strip()
+        choices = result.get("choices", [])
+        reply = ""
 
-            if not reply:
-                raise HTTPException(
-                    status_code=502,
-                    detail="Gemini не вернула текстовый ответ."
-                )
-
-            return {"reply": reply}
-
-        except urllib.error.HTTPError as exc:
-            error_text = exc.read().decode(
-                "utf-8", errors="replace"
+        if choices:
+            reply = (
+                choices[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
             )
 
-            # Повторяем запрос при перегрузке или ограничении запросов
-            if exc.code in (503, 429) and attempt < 2:
-                time.sleep(2 * (attempt + 1))
-                continue
+        if not reply:
+            raise HTTPException(
+                status_code=502,
+                detail="GigaChat не вернул текстовый ответ."
+            )
 
-            if exc.code in (400, 401, 403):
-                raise HTTPException(
-                    status_code=502,
-                    detail=(
-                        "Gemini отклонила запрос. Проверь API-ключ, "
-                        "доступность модели и ограничения API."
-                    )
-                ) from exc
+        return {"reply": reply}
 
-            if exc.code == 429:
-                raise HTTPException(
-                    status_code=503,
-                    detail=(
-                        "Превышен лимит запросов Gemini. "
-                        "Попробуй позже."
-                    )
-                ) from exc
+    except urllib.error.HTTPError as exc:
+        error_text = exc.read().decode(
+            "utf-8", errors="replace"
+        )
 
-            if exc.code == 503:
-                raise HTTPException(
-                    status_code=503,
-                    detail=(
-                        "Gemini временно перегружена. "
-                        "Попробуй отправить сообщение позже."
-                    )
-                ) from exc
+        if exc.code == 401:
+            global _access_token, _token_expires_at
+            _access_token = None
+            _token_expires_at = 0
 
             raise HTTPException(
                 status_code=502,
-                detail=(
-                    f"Ошибка Gemini API ({exc.code}): "
-                    f"{error_text[:500]}"
-                )
+                detail="GigaChat отклонил авторизацию. Проверь ключ."
             ) from exc
 
-        except (urllib.error.URLError, TimeoutError) as exc:
+        if exc.code == 429:
             raise HTTPException(
-                status_code=504,
-                detail=(
-                    "Gemini не ответила вовремя. "
-                    "Попробуй ещё раз."
-                )
+                status_code=429,
+                detail="Превышен лимит запросов GigaChat. Попробуй позже."
             ) from exc
 
-    raise HTTPException(
-        status_code=503,
-        detail="Gemini временно недоступна. Попробуй позже."
-    )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Ошибка GigaChat ({exc.code}): {error_text[:500]}"
+        ) from exc
+
+    except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="GigaChat не ответил вовремя. Попробуй ещё раз."
+        ) from exc
