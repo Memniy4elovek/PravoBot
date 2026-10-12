@@ -1,4 +1,5 @@
-
+import certifi
+import ssl
 import json
 import os
 import time
