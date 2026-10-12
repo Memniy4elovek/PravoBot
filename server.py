@@ -1,6 +1,7 @@
-
+```python
 import os
 import json
+import time
 import urllib.request
 import urllib.error
 
@@ -105,63 +106,92 @@ def chat(request: ChatRequest):
         method="POST",
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=90) as response:
-            result = json.loads(
-                response.read().decode("utf-8")
+    # До 3 попыток при временной перегрузке Gemini
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=90) as response:
+                result = json.loads(
+                    response.read().decode("utf-8")
+                )
+
+            candidates = result.get("candidates", [])
+            parts = (
+                candidates[0]
+                .get("content", {})
+                .get("parts", [])
+                if candidates else []
             )
 
-        candidates = result.get("candidates", [])
-        parts = (
-            candidates[0]
-            .get("content", {})
-            .get("parts", [])
-            if candidates else []
-        )
+            reply = "\n".join(
+                part.get("text", "")
+                for part in parts
+                if part.get("text")
+            ).strip()
 
-        reply = "\n".join(
-            part.get("text", "")
-            for part in parts
-            if part.get("text")
-        ).strip()
+            if not reply:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Gemini не вернула текстовый ответ."
+                )
 
-        if not reply:
-            raise HTTPException(
-                status_code=502,
-                detail="Gemini не вернула текстовый ответ."
+            return {"reply": reply}
+
+        except urllib.error.HTTPError as exc:
+            error_text = exc.read().decode(
+                "utf-8", errors="replace"
             )
 
-        return {"reply": reply}
+            # Повторяем запрос при перегрузке или ограничении запросов
+            if exc.code in (503, 429) and attempt < 2:
+                time.sleep(2 * (attempt + 1))
+                continue
 
-    except urllib.error.HTTPError as exc:
-        error_text = exc.read().decode(
-            "utf-8", errors="replace"
-        )
-        if exc.code in (400, 401, 403):
+            if exc.code in (400, 401, 403):
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        "Gemini отклонила запрос. Проверь API-ключ, "
+                        "доступность модели и ограничения API."
+                    )
+                ) from exc
+
+            if exc.code == 429:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Превышен лимит запросов Gemini. "
+                        "Попробуй позже."
+                    )
+                ) from exc
+
+            if exc.code == 503:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Gemini временно перегружена. "
+                        "Попробуй отправить сообщение позже."
+                    )
+                ) from exc
+
             raise HTTPException(
                 status_code=502,
                 detail=(
-                    "Gemini отклонила запрос. Проверь API-ключ, "
-                    "доступность модели и ограничения API."
+                    f"Ошибка Gemini API ({exc.code}): "
+                    f"{error_text[:500]}"
                 )
             ) from exc
 
-        if exc.code == 429:
+        except (urllib.error.URLError, TimeoutError) as exc:
             raise HTTPException(
-                status_code=503,
+                status_code=504,
                 detail=(
-                    "Превышен лимит запросов Gemini. "
-                    "Попробуй позже."
+                    "Gemini не ответила вовремя. "
+                    "Попробуй ещё раз."
                 )
             ) from exc
 
-        raise HTTPException(
-            status_code=502,
-            detail=f"Ошибка Gemini API ({exc.code}): {error_text[:500]}"
-        ) from exc
-
-    except (urllib.error.URLError, TimeoutError) as exc:
-        raise HTTPException(
-            status_code=504,
-            detail="Gemini не ответила вовремя. Попробуй ещё раз."
-        ) from exc
+    raise HTTPException(
+        status_code=503,
+        detail="Gemini временно недоступна. Попробуй позже."
+    )
+```
