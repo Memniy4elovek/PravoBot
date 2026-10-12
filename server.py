@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 API_KEY = os.getenv("GEMINI_API_KEY", "")
-MODEL = "gemini-3.8-flash"
+MODEL = "gemini-3.7-flash"
 
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/"
