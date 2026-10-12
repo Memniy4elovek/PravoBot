@@ -1,10 +1,11 @@
+
 import json
 import os
 import time
 import uuid
+import socket
 import urllib.request
 import urllib.error
-import socket
 from urllib.parse import urlencode
 
 from fastapi import FastAPI, HTTPException
@@ -12,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 
-# Настройки из Render Environment
+# Настройки Render
 GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS", "").strip()
 MODEL = os.getenv("GIGACHAT_MODEL", "GigaChat-3-Ultra")
 
@@ -51,8 +52,6 @@ SYSTEM_PROMPT = """
 10. Напоминай, что ответ не заменяет консультацию юриста.
 """
 
-
-# Кэш токена: повторно используем его до истечения срока
 _access_token = None
 _token_expires_at = 0
 
@@ -63,7 +62,7 @@ def get_access_token():
     if not GIGACHAT_CREDENTIALS:
         raise HTTPException(
             status_code=500,
-            detail="Не настроен GIGACHAT_CREDENTIALS в Render."
+            detail="В Render не задан GIGACHAT_CREDENTIALS."
         )
 
     if _access_token and time.time() < _token_expires_at - 60:
@@ -86,54 +85,51 @@ def get_access_token():
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=30) as response:
+        with urllib.request.urlopen(req, timeout=20) as response:
             result = json.loads(response.read().decode("utf-8"))
 
         _access_token = result.get("access_token")
-        expires_at = result.get("expires_at", 0)
+        expires_at = result.get("expires_at")
 
         if not _access_token:
+            print("GigaChat OAuth: access_token отсутствует", flush=True)
             raise HTTPException(
                 status_code=502,
                 detail="GigaChat не вернул токен доступа."
             )
 
-        _token_expires_at = (
-            float(expires_at)
-            if expires_at
-            else time.time() + 1800
-        )
+        if expires_at:
+            expires_at = float(expires_at)
+            # API может вернуть время в миллисекундах
+            if expires_at > 10**12:
+                expires_at /= 1000
+            _token_expires_at = expires_at
+        else:
+            _token_expires_at = time.time() + 1800
 
         return _access_token
 
     except urllib.error.HTTPError as exc:
-        error_text = exc.read().decode(
-            "utf-8", errors="replace"
+        error_text = exc.read().decode("utf-8", errors="replace")
+        print(
+            f"GigaChat OAuth HTTP {exc.code}: {error_text[:500]}",
+            flush=True
         )
-        if exc.code in (400, 401, 403):
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    "GigaChat не выдал токен. "
-                    "Проверь ключ авторизации и права доступа."
-                )
-            ) from exc
-
         raise HTTPException(
             status_code=502,
-            detail=f"Ошибка авторизации GigaChat ({exc.code})."
+            detail=f"Ошибка авторизации GigaChat (HTTP {exc.code})."
         ) from exc
 
-   except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
-    print(
-        f"GigaChat OAuth connection error: "
-        f"{type(exc).__name__}: {exc}",
-        flush=True
-    )
-    raise HTTPException(
-        status_code=504,
-        detail="Не удалось подключиться к GigaChat для авторизации."
-    ) from exc
+    except (urllib.error.URLError, socket.timeout, TimeoutError, OSError) as exc:
+        print(
+            f"GigaChat OAuth connection error: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True
+        )
+        raise HTTPException(
+            status_code=504,
+            detail="Не удалось подключиться к GigaChat для авторизации."
+        ) from exc
 
 
 @app.get("/")
@@ -148,6 +144,8 @@ def health():
 
 @app.post("/chat")
 def chat(request: ChatRequest):
+    global _access_token, _token_expires_at
+
     message = request.message.strip()
 
     if not message:
@@ -171,9 +169,7 @@ def chat(request: ChatRequest):
 
     req = urllib.request.Request(
         CHAT_URL,
-        data=json.dumps(
-            payload, ensure_ascii=False
-        ).encode("utf-8"),
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
@@ -183,23 +179,19 @@ def chat(request: ChatRequest):
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=120) as response:
-            result = json.loads(
-                response.read().decode("utf-8")
-            )
+        with urllib.request.urlopen(req, timeout=90) as response:
+            result = json.loads(response.read().decode("utf-8"))
 
         choices = result.get("choices", [])
         reply = ""
 
         if choices:
-            reply = (
-                choices[0]
-                .get("message", {})
-                .get("content", "")
-                .strip()
-            )
+            content = choices[0].get("message", {}).get("content", "")
+            if isinstance(content, str):
+                reply = content.strip()
 
         if not reply:
+            print("GigaChat: ответ без текста", flush=True)
             raise HTTPException(
                 status_code=502,
                 detail="GigaChat не вернул текстовый ответ."
@@ -208,32 +200,37 @@ def chat(request: ChatRequest):
         return {"reply": reply}
 
     except urllib.error.HTTPError as exc:
-        error_text = exc.read().decode(
-            "utf-8", errors="replace"
+        error_text = exc.read().decode("utf-8", errors="replace")
+        print(
+            f"GigaChat API HTTP {exc.code}: {error_text[:500]}",
+            flush=True
         )
 
         if exc.code == 401:
-            global _access_token, _token_expires_at
             _access_token = None
             _token_expires_at = 0
-
             raise HTTPException(
                 status_code=502,
-                detail="GigaChat отклонил авторизацию. Проверь ключ."
+                detail="GigaChat отклонил токен доступа."
             ) from exc
 
         if exc.code == 429:
             raise HTTPException(
                 status_code=429,
-                detail="Превышен лимит запросов GigaChat. Попробуй позже."
+                detail="Превышен лимит запросов GigaChat."
             ) from exc
 
         raise HTTPException(
             status_code=502,
-            detail=f"Ошибка GigaChat ({exc.code}): {error_text[:500]}"
+            detail=f"Ошибка GigaChat API (HTTP {exc.code})."
         ) from exc
 
-    except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
+    except (urllib.error.URLError, socket.timeout, TimeoutError, OSError) as exc:
+        print(
+            f"GigaChat API connection error: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True
+        )
         raise HTTPException(
             status_code=504,
             detail="GigaChat не ответил вовремя. Попробуй ещё раз."
