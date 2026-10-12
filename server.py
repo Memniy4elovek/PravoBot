@@ -1,28 +1,26 @@
 
-import certifi
-import ssl
 import json
+import logging
 import os
+import ssl
 import time
 import uuid
-import socket
-import urllib.request
 import urllib.error
-from urllib.parse import urlencode
+import urllib.parse
+import urllib.request
 
+import certifi
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 
-# Настройки GigaChat
-GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS", "").strip()
-MODEL = os.getenv("GIGACHAT_MODEL", "GigaChat-3-Ultra")
+# --------------------------------------------------
+# Настройки приложения
+# --------------------------------------------------
 
-TOKEN_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
-CHAT_URL = "https://api.giga.chat/v1/chat/completions"
-
-SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("pravobot")
 
 app = FastAPI(title="PravoBot API")
 
@@ -30,31 +28,70 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-class ChatRequest(BaseModel):
-    message: str
+GIGACHAT_CREDENTIALS = os.getenv(
+    "GIGACHAT_CREDENTIALS", ""
+).strip()
+
+MODEL = os.getenv(
+    "GIGACHAT_MODEL", "GigaChat-3-Ultra"
+)
+
+TOKEN_URL = (
+    "https://ngw.devices.sberbank.ru:9443"
+    "/api/v2/oauth"
+)
+
+CHAT_URL = (
+    "https://api.giga.chat/v1/chat/completions"
+)
+
+# Сертификат, добавленный в репозиторий GitHub
+GIGACHAT_CERT = os.path.join(
+    BASE_DIR, "Russian_Trusted_Root_CA.cer"
+)
 
 
-SYSTEM_PROMPT = """
-Ты — ПравоБот, помощник по первичной правовой информации
-в Российской Федерации.
+# --------------------------------------------------
+# SSL: стандартные сертификаты + сертификат Минцифры
+# --------------------------------------------------
 
-Правила ответа:
-1. Всегда отвечай на русском языке.
-2. Сразу отвечай по существу, без рассуждений вслух.
-3. Используй понятную структуру и короткие абзацы.
-4. Не выдумывай статьи законов, судебные решения и ссылки.
-5. Если не уверен в норме права, прямо сообщи об этом.
-6. Учитывай, что законодательство может меняться.
-7. Если данных недостаточно, задай уточняющий вопрос.
-8. Помогай составлять черновики правовых документов.
-9. Не обещай гарантированный юридический результат.
-10. Напоминай, что ответ не заменяет консультацию юриста.
-"""
+def create_ssl_context():
+    context = ssl.create_default_context(
+        cafile=certifi.where()
+    )
+
+    if not os.path.isfile(GIGACHAT_CERT):
+        raise RuntimeError(
+            "Не найден сертификат GigaChat: "
+            + GIGACHAT_CERT
+        )
+
+    try:
+        context.load_verify_locations(
+            cafile=GIGACHAT_CERT
+        )
+    except (ssl.SSLError, OSError) as exc:
+        raise RuntimeError(
+            "Не удалось загрузить сертификат "
+            "Russian_Trusted_Root_CA.cer. "
+            "Проверь его формат PEM."
+        ) from exc
+
+    return context
+
+
+SSL_CONTEXT = create_ssl_context()
+
+
+# --------------------------------------------------
+# Кэш OAuth-токена
+# --------------------------------------------------
 
 _access_token = None
 _token_expires_at = 0
@@ -64,234 +101,284 @@ def get_access_token():
     global _access_token, _token_expires_at
 
     if not GIGACHAT_CREDENTIALS:
-        raise HTTPException(
-            status_code=500,
-            detail="В Render не задан GIGACHAT_CREDENTIALS."
+        raise RuntimeError(
+            "Не задана переменная "
+            "GIGACHAT_CREDENTIALS в Render."
         )
 
-    # Используем действующий токен, если он ещё не истёк
-    if _access_token and time.time() < _token_expires_at - 60:
+    # Используем кэш, если токен ещё действителен
+    if (
+        _access_token
+        and time.time() < _token_expires_at
+    ):
         return _access_token
 
-    data = urlencode({
+    headers = {
+        "Authorization": (
+            f"Basic {GIGACHAT_CREDENTIALS}"
+        ),
+        "RqUID": str(uuid.uuid4()),
+        "Content-Type": (
+            "application/x-www-form-urlencoded"
+        ),
+        "Accept": "application/json",
+    }
+
+    body = urllib.parse.urlencode({
         "scope": "GIGACHAT_API_PERS"
     }).encode("utf-8")
 
-    req = urllib.request.Request(
+    request = urllib.request.Request(
         TOKEN_URL,
-        data=data,
-        headers={
-            "Authorization": f"Basic {GIGACHAT_CREDENTIALS}",
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-            "RqUID": str(uuid.uuid4()),
-        },
+        data=body,
+        headers=headers,
         method="POST",
     )
 
     try:
         with urllib.request.urlopen(
-            req,
-            timeout=20,
-            context=SSL_CONTEXT
+            request,
+            timeout=25,
+            context=SSL_CONTEXT,
         ) as response:
-            result = json.loads(response.read().decode("utf-8"))
+            result = json.loads(
+                response.read().decode("utf-8")
+            )
 
-        _access_token = result.get("access_token")
+        _access_token = result["access_token"]
+
+        # Обновляем токен заранее, до истечения срока
         expires_at = result.get("expires_at")
 
-        if not _access_token:
-            print(
-                "GigaChat OAuth: access_token отсутствует",
-                flush=True
-            )
-            raise HTTPException(
-                status_code=502,
-                detail="GigaChat не вернул токен доступа."
-            )
-
         if expires_at:
+            # GigaChat обычно возвращает время в мс
             expires_at = float(expires_at)
 
-            # При необходимости преобразуем миллисекунды в секунды
             if expires_at > 10**12:
                 expires_at /= 1000
 
-            _token_expires_at = expires_at
+            _token_expires_at = expires_at - 60
         else:
-            _token_expires_at = time.time() + 1800
+            _token_expires_at = time.time() + 1500
 
+        logger.info("OAuth-токен GigaChat получен")
         return _access_token
 
     except urllib.error.HTTPError as exc:
-        error_text = exc.read().decode(
-            "utf-8",
-            errors="replace"
+        error_body = exc.read().decode(
+            "utf-8", errors="replace"
         )
-        print(
-            f"GigaChat OAuth HTTP {exc.code}: {error_text[:500]}",
-            flush=True
+
+        logger.error(
+            "GigaChat OAuth HTTP %s: %s",
+            exc.code,
+            error_body[:1000],
         )
-        raise HTTPException(
-            status_code=502,
-            detail=f"Ошибка авторизации GigaChat (HTTP {exc.code})."
+
+        raise RuntimeError(
+            f"Ошибка авторизации GigaChat: HTTP {exc.code}"
         ) from exc
 
     except (
         urllib.error.URLError,
-        socket.timeout,
         TimeoutError,
-        OSError
+        ssl.SSLError,
+        json.JSONDecodeError,
+        KeyError,
+        ValueError,
     ) as exc:
-        print(
-            f"GigaChat OAuth connection error: "
-            f"{type(exc).__name__}: {exc}",
-            flush=True
+        logger.error(
+            "GigaChat OAuth error: %s: %s",
+            type(exc).__name__,
+            str(exc),
         )
-        raise HTTPException(
-            status_code=504,
-            detail="Не удалось подключиться к GigaChat для авторизации."
+
+        raise RuntimeError(
+            "Не удалось получить OAuth-токен GigaChat."
         ) from exc
 
 
-@app.get("/")
-def home():
-    return {
-        "status": "ok",
-        "service": "PravoBot"
-    }
+# --------------------------------------------------
+# Модели запросов и ответов
+# --------------------------------------------------
+
+class ChatRequest(BaseModel):
+    message: str
 
 
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "model": MODEL
-    }
+# --------------------------------------------------
+# Основной запрос к GigaChat
+# --------------------------------------------------
 
-
-@app.post("/chat")
-def chat(request: ChatRequest):
-    global _access_token, _token_expires_at
-
-    message = request.message.strip()
-
-    if not message:
-        raise HTTPException(
-            status_code=400,
-            detail="Сообщение не должно быть пустым."
-        )
-
+def ask_gigachat(message: str) -> str:
     token = get_access_token()
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
 
     payload = {
         "model": MODEL,
         "messages": [
             {
                 "role": "system",
-                "content": SYSTEM_PROMPT
+                "content": (
+                    "Ты — PravoBot, помощник по первичной "
+                    "правовой помощи в Российской Федерации. "
+                    "Отвечай на русском языке, понятно и "
+                    "структурированно. Учитывай актуальность "
+                    "законодательства, не выдумывай статьи "
+                    "законов и судебную практику. "
+                    "Если данных недостаточно, задай уточняющие "
+                    "вопросы. Объясняй порядок действий, "
+                    "необходимые документы и возможные сроки. "
+                    "Предупреждай, когда для точного ответа "
+                    "нужна проверка актуальной редакции закона "
+                    "или консультация юриста. Если пользователь "
+                    "просит подготовить документ, составь "
+                    "подходящий текст и оставь места для "
+                    "неизвестных персональных данных."
+                ),
             },
             {
                 "role": "user",
-                "content": message
+                "content": message,
             },
         ],
         "temperature": 0.3,
-        "max_tokens": 1024,
-        "stream": False,
+        "max_tokens": 2500,
     }
 
-    req = urllib.request.Request(
+    request = urllib.request.Request(
         CHAT_URL,
         data=json.dumps(
-            payload,
-            ensure_ascii=False
+            payload, ensure_ascii=False
         ).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
+        headers=headers,
         method="POST",
     )
 
     try:
         with urllib.request.urlopen(
-            req,
+            request,
             timeout=90,
-            context=SSL_CONTEXT
+            context=SSL_CONTEXT,
         ) as response:
             result = json.loads(
                 response.read().decode("utf-8")
             )
 
-        choices = result.get("choices", [])
-        reply = ""
-
-        if choices:
-            content = choices[0].get(
-                "message", {}
-            ).get("content", "")
-
-            if isinstance(content, str):
-                reply = content.strip()
-
-        if not reply:
-            print(
-                "GigaChat: ответ без текста",
-                flush=True
-            )
-            raise HTTPException(
-                status_code=502,
-                detail="GigaChat не вернул текстовый ответ."
-            )
-
-        return {
-            "reply": reply
-        }
+        return result["choices"][0]["message"]["content"]
 
     except urllib.error.HTTPError as exc:
-        error_text = exc.read().decode(
-            "utf-8",
-            errors="replace"
-        )
-        print(
-            f"GigaChat API HTTP {exc.code}: {error_text[:500]}",
-            flush=True
+        error_body = exc.read().decode(
+            "utf-8", errors="replace"
         )
 
+        logger.error(
+            "GigaChat API HTTP %s: %s",
+            exc.code,
+            error_body[:1500],
+        )
+
+        # Если токен отклонён, сбрасываем кэш
         if exc.code == 401:
+            global _access_token, _token_expires_at
             _access_token = None
             _token_expires_at = 0
 
-            raise HTTPException(
-                status_code=502,
-                detail="GigaChat отклонил токен доступа."
+            raise RuntimeError(
+                "GigaChat отклонил токен авторизации. "
+                "Попробуй повторить запрос."
             ) from exc
 
         if exc.code == 429:
-            raise HTTPException(
-                status_code=429,
-                detail="Превышен лимит запросов GigaChat."
+            raise RuntimeError(
+                "Превышен лимит запросов GigaChat. "
+                "Попробуй позже."
             ) from exc
 
-        raise HTTPException(
-            status_code=502,
-            detail=f"Ошибка GigaChat API (HTTP {exc.code})."
+        raise RuntimeError(
+            f"Ошибка GigaChat API: HTTP {exc.code}"
         ) from exc
 
     except (
         urllib.error.URLError,
-        socket.timeout,
         TimeoutError,
-        OSError
+        ssl.SSLError,
+        json.JSONDecodeError,
+        KeyError,
+        IndexError,
+        TypeError,
     ) as exc:
-        print(
-            f"GigaChat API connection error: "
-            f"{type(exc).__name__}: {exc}",
-            flush=True
+        logger.error(
+            "GigaChat API error: %s: %s",
+            type(exc).__name__,
+            str(exc),
         )
-        raise HTTPException(
-            status_code=504,
-            detail="GigaChat не ответил вовремя. Попробуй ещё раз."
+
+        raise RuntimeError(
+            "Не удалось получить ответ от GigaChat."
         ) from exc
+
+
+# --------------------------------------------------
+# Маршруты FastAPI
+# --------------------------------------------------
+
+@app.get("/")
+def home():
+    return {
+        "status": "ok",
+        "service": "PravoBot API",
+    }
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/chat")
+def chat(request: ChatRequest):
+    message = request.message.strip()
+
+    if not message:
+        raise HTTPException(
+            status_code=400,
+            detail="Введите сообщение.",
+        )
+
+    if len(message) > 12000:
+        raise HTTPException(
+            status_code=400,
+            detail="Сообщение слишком длинное.",
+        )
+
+    try:
+        reply = ask_gigachat(message)
+
+        return {"reply": reply}
+
+    except RuntimeError as exc:
+        logger.error("Ошибка /chat: %s", str(exc))
+
+        raise HTTPException(
+            status_code=502,
+            detail=str(exc),
+        ) from exc
+
+    except Exception:
+        logger.exception(
+            "Непредвиденная ошибка обработки /chat"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Внутренняя ошибка сервера. "
+                "Попробуй позже."
+            ),
+        )
